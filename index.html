@@ -243,7 +243,16 @@ body{font-family:'Noto Sans SC',sans-serif;background:var(--bg);color:var(--text
         <div class="cal-legend-item"><div class="cal-legend-dot" style="background:var(--surface2)"></div>有打卡记录</div>
       </div>
     </div>
-    <div class="cal-footer"><button class="btn-full" onclick="calGoToday()">回到今天</button></div>
+    <div class="cal-footer">
+      <button class="btn-full" onclick="calGoToday()" style="margin-bottom:8px">回到今天</button>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn-full" onclick="exportCSV()" style="background:var(--surface);color:var(--text);border:1.5px solid var(--border);font-size:13px">📥 导出 CSV</button>
+        <label class="btn-full" style="background:var(--surface);color:var(--text);border:1.5px solid var(--border);font-size:13px;text-align:center;cursor:pointer">
+          📤 导入备份
+          <input type="file" accept=".csv" style="display:none" onchange="importCSV(this)">
+        </label>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -269,13 +278,32 @@ const CATEGORIES = [
 let userLib = {}; // {catName: string[]}
 
 function loadLib() {
-  try { userLib = JSON.parse(localStorage.getItem('adhd-lib-v1') || '{}'); } catch(e) {}
-  CATEGORIES.forEach(c => { if (!userLib[c.name]) userLib[c.name] = [...c.defaults]; });
+  // 先用默认值填充，保证即使 localStorage 不可用也能正常工作
+  CATEGORIES.forEach(c => { userLib[c.name] = [...c.defaults]; });
+  // 再尝试从 localStorage 读取用户自定义（如果有）
+  try {
+    const saved = localStorage.getItem('adhd-lib-v1');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      CATEGORIES.forEach(c => {
+        if (parsed[c.name] && parsed[c.name].length > 0) {
+          userLib[c.name] = parsed[c.name];
+        }
+      });
+    }
+  } catch(e) {}
 }
-function saveLib() { localStorage.setItem('adhd-lib-v1', JSON.stringify(userLib)); }
+function saveLib() {
+  try { localStorage.setItem('adhd-lib-v1', JSON.stringify(userLib)); } catch(e) {}
+}
 
 function allLibTasks() {
-  return CATEGORIES.flatMap(c => userLib[c.name] || []);
+  const all = CATEGORIES.flatMap(c => userLib[c.name] || []);
+  // 兜底：如果任务库为空，返回所有分类的默认任务
+  if (all.length === 0) {
+    return CATEGORIES.flatMap(c => c.defaults);
+  }
+  return all;
 }
 
 // ── Core ─────────────────────────────────────────────────────
@@ -291,28 +319,49 @@ let tasks=[], done=new Set(), bingoLines=new Set(), bingoCount=0;
 function dk(d){ d=d||new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 
 function load() {
-  const raw = localStorage.getItem('adhd-bingo-v3');
+  let raw = null;
+  try { raw = localStorage.getItem('adhd-bingo-v3'); } catch(e) {}
   if (raw) {
     try {
       const data = JSON.parse(raw);
-      if (data.dateKey === dk()) { tasks=data.tasks; done=new Set(data.done); return; }
-      else {
-        const od=new Set(data.done);
-        saveHistory(data.dateKey, od.size, LINES.filter(l=>l.every(i=>od.has(i))).length);
+      if (data.dateKey === dk()) {
+        // 今天的记录，直接恢复
+        tasks = data.tasks && data.tasks.length === GRID_SIZE ? data.tasks : pickTasks();
+        done = new Set(data.done);
+        return;
+      } else {
+        // 跨天：把昨天的数据存入历史
+        const od = new Set(data.done);
+        saveHistory(
+          data.dateKey,
+          od.size,
+          LINES.filter(l => l.every(i => od.has(i))).length,
+          data.tasks ? [...od].map(i => data.tasks[i]).filter(Boolean) : []
+        );
       }
-    } catch(e){}
+    } catch(e) {}
   }
-  tasks=pickTasks(); done=new Set(); saveToday();
+  // 新的一天或首次打开：随机生成任务
+  tasks = pickTasks();
+  done = new Set();
+  saveToday();
 }
 
 function saveToday() {
-  localStorage.setItem('adhd-bingo-v3', JSON.stringify({dateKey:dk(),tasks,done:[...done]}));
-  saveHistory(dk(), done.size, bingoCount);
+  try { localStorage.setItem('adhd-bingo-v3', JSON.stringify({dateKey:dk(),tasks,done:[...done]})); } catch(e) {}
+  const doneTasks = [...done].map(i => tasks[i]).filter(Boolean);
+  saveHistory(dk(), done.size, bingoCount, doneTasks);
 }
 
-function saveHistory(key,doneCount,bingo) {
+function saveHistory(key, doneCount, bingo, doneTasks) {
   let h={}; try{h=JSON.parse(localStorage.getItem('adhd-bingo-hist')||'{}');}catch(e){}
-  h[key]={doneCount,bingo}; localStorage.setItem('adhd-bingo-hist',JSON.stringify(h));
+  const existing = h[key] || {};
+  h[key] = {
+    doneCount,
+    bingo,
+    doneTasks: doneTasks !== undefined ? doneTasks : (existing.doneTasks || [])
+  };
+  try { localStorage.setItem('adhd-bingo-hist', JSON.stringify(h)); } catch(e) {}
 }
 function getHistory(){try{return JSON.parse(localStorage.getItem('adhd-bingo-hist')||'{}');}catch(e){return {};}}
 
@@ -531,6 +580,119 @@ function renderLibPicker(){
 
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
+// ── CSV 导出 ──────────────────────────────────────────────────
+function exportCSV() {
+  const hist = getHistory();
+  const days = ['日','一','二','三','四','五','六'];
+  const keys = Object.keys(hist).sort();
+  if (!keys.length) { showToast('暂无历史记录'); return; }
+
+  // CSV字段转义（含逗号或引号时加双引号包裹）
+  function escField(v) {
+    const s = String(v == null ? '' : v);
+    if (s.indexOf(',') !== -1 || s.indexOf('"') !== -1) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+
+  const rows = [['日期','星期','打卡数','Bingo条数','完成率','完成的任务'].map(escField).join(',')];
+  keys.forEach(function(key) {
+    const rec = hist[key];
+    const d = new Date(key);
+    const dow = isNaN(d.getTime()) ? '' : days[d.getDay()];
+    const pct = Math.round((rec.doneCount / 25) * 100) + '%';
+    const taskStr = (rec.doneTasks || []).join(' | ');
+    rows.push([key, dow, rec.doneCount, rec.bingo, pct, taskStr].map(escField).join(','));
+  });
+
+  const bom = '\uFEFF';
+  const csv = bom + rows.join('\r\n');
+  const blob = new Blob([csv], {type: 'text/csv;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'ADHD-Bingo-' + dk() + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('CSV 已导出 ✓');
+}
+
+// ── CSV 导入（恢复备份）────────────────────────────────────────
+function importCSV(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      let text = e.target.result;
+      if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+      // 按换行切分（兼容 \r\n 和 \n）
+      const lines = text.split('\r\n').join('\n').split('\n').filter(function(l){ return l.trim(); });
+      if (lines.length < 2) { showToast('文件内容为空'); return; }
+
+      // 简单CSV行解析，支持引号字段
+      function parseCSVLine(line) {
+        const result = [];
+        let cur = '', inQ = false, i = 0;
+        while (i < line.length) {
+          const ch = line[i];
+          if (ch === '"') {
+            if (inQ && line[i+1] === '"') { cur += '"'; i += 2; continue; }
+            inQ = !inQ;
+          } else if (ch === ',' && !inQ) {
+            result.push(cur); cur = '';
+          } else {
+            cur += ch;
+          }
+          i++;
+        }
+        result.push(cur);
+        return result;
+      }
+
+      const header = parseCSVLine(lines[0]);
+      const iDate  = header.indexOf('日期');
+      const iDone  = header.indexOf('打卡数');
+      const iBingo = header.indexOf('Bingo条数');
+      const iTasks = header.indexOf('完成的任务');
+
+      if (iDate < 0 || iDone < 0 || iBingo < 0) {
+        showToast('格式不匹配，请使用本工具导出的CSV'); return;
+      }
+
+      let h = {};
+      try { h = JSON.parse(localStorage.getItem('adhd-bingo-hist') || '{}'); } catch(e2) {}
+      let imported = 0;
+
+      for (let i = 1; i < lines.length; i++) {
+        const cols = parseCSVLine(lines[i]);
+        const key = (cols[iDate] || '').trim();
+        // 验证日期格式 yyyy-mm-dd
+        if (!key || key.length !== 10 || key[4] !== '-' || key[7] !== '-') continue;
+        const doneCount = parseInt(cols[iDone]) || 0;
+        const bingo     = parseInt(cols[iBingo]) || 0;
+        const doneTasks = (iTasks >= 0 && cols[iTasks])
+          ? cols[iTasks].split(' | ').map(function(t){ return t.trim(); }).filter(Boolean)
+          : [];
+        if (!h[key]) {
+          h[key] = { doneCount: doneCount, bingo: bingo, doneTasks: doneTasks };
+          imported++;
+        }
+      }
+
+      try { localStorage.setItem('adhd-bingo-hist', JSON.stringify(h)); } catch(e3) {}
+      renderCalendar();
+      showToast('已导入 ' + imported + ' 条记录 ✓');
+    } catch(err) {
+      showToast('导入失败，请检查文件格式');
+    }
+    input.value = '';
+  };
+  reader.readAsText(file, 'utf-8');
+}
+
 // ── Calendar ─────────────────────────────────────────────────
 let calYear,calMonth;
 function openCalendar(){const n=new Date();calYear=n.getFullYear();calMonth=n.getMonth();renderCalendar();document.getElementById('cal-modal').classList.add('open');}
@@ -559,7 +721,7 @@ function renderCalendar(){
 
 // ── Boot ─────────────────────────────────────────────────────
 loadLib(); renderDate(); load(); renderGrid(); updateUI();
-saveHistory(dk(), done.size, bingoCount);
+saveHistory(dk(), done.size, bingoCount, [...done].map(i=>tasks[i]).filter(Boolean));
 </script>
 </body>
 </html>
